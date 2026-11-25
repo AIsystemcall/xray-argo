@@ -108,7 +108,7 @@ async function generateConfig() {
       { 
         port: ARGO_PORT, 
         protocol: 'vless', 
-        settings: { clients: [{ id: UUID }], decryption: 'none', fallbacks: [{ path: "/vless-argo", dest: 3002 }, { path: "/vmess-argo", dest: 3003 }] }, 
+        settings: { clients: [{ id: UUID }], decryption: 'none', fallbacks: [{ path: "/vless-argo", dest: 3002 }, { path: "/vmess-argo", dest: 3003 }, { path: "/" + UUID, dest: Number(PORT) }] }, 
         streamSettings: { network: 'tcp' } 
       },
       { port: 3002, listen: "127.0.0.1", protocol: "vless", settings: { clients: [{ id: UUID }], decryption: "none" }, streamSettings: { network: "ws", wsSettings: { path: "/vless-argo" } } },
@@ -443,6 +443,7 @@ app.get("/health", (req, res) => {
 
 // ===== 分享連結產生 =====
 // v3 http2-fix
+// v4 https-sub
 function publicDomain() {
   const d = (ARGO_DOMAIN || runtimeDomain || '').trim();
   if (d) return d;
