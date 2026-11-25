@@ -248,10 +248,10 @@ async function downloadCloudflared(arch) {
 // 啟動 cloudflared 並驗證連線
 async function startCloudflared(argoArgs) {
   return new Promise((resolve, reject) => {
-    // 開啟 log 檔案
-    const logFd = fs.openSync(logPath, 'a');
+    // v3: cloudflared 的 INF 日誌走 stderr，必須同時接管兩個串流
+    try { fs.writeFileSync(logPath, ''); } catch (_) {}
     const child = require('child_process').spawn(botPath, argoArgs.split(' '), {
-      stdio: ['ignore', 'pipe', logFd],  // 使用檔案描述符而非 WriteStream
+      stdio: ['ignore', 'pipe', 'pipe'],
       detached: true
     });
 
@@ -261,9 +261,10 @@ async function startCloudflared(argoArgs) {
     let connected = false;
     let output = '';
 
-    child.stdout.on('data', (data) => {
+    const onData = (data) => {
       const msg = data.toString();
       output += msg;
+      try { fs.appendFileSync(logPath, msg); } catch (_) {}
       console.log(`[cloudflared] ${msg.trim()}`);
 
       // Quick Tunnel：抓取 trycloudflare 域名，供訂閱連結使用
@@ -273,20 +274,21 @@ async function startCloudflared(argoArgs) {
         console.log(`Detected quick tunnel domain: ${runtimeDomain}`);
       }
 
-      if (msg.includes('Connected to Cloudflare') || 
+      if (msg.includes('Registered tunnel connection') ||
+          msg.includes('Connected to Cloudflare') ||
           msg.includes('Starting tunnel') ||
           msg.includes('Registered tunnel')) {
         connected = true;
       }
-    });
+    };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
 
     child.on('error', (err) => {
-      fs.closeSync(logFd);
       reject(new Error(`cloudflared spawn error: ${err.message}`));
     });
 
     child.on('exit', (code) => {
-      fs.closeSync(logFd);
       if (!connected && code !== 0) {
         const logContent = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
         reject(new Error(`cloudflared exited with code ${code}. Log: ${logContent.slice(-500)}`));
@@ -301,9 +303,9 @@ async function startCloudflared(argoArgs) {
         const logContent = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
         console.error('cloudflared connection timeout. Recent log:');
         console.error(logContent.slice(-1000));
-        reject(new Error('cloudflared failed to connect within 15s. Check ARGO_AUTH token and network.'));
+        reject(new Error('cloudflared failed to connect within 45s. Check ARGO_AUTH token and network.'));
       }
-    }, 15000);
+    }, 45000);
 
     const checkInterval = setInterval(() => {
       if (connected) {
@@ -388,11 +390,11 @@ async function startScripts() {
       }
 
       console.log(`Token parsed OK: accountTag=${String(accountTag).slice(0,8)}... tunnelID=${tunnelID}`);
-      argoArgs = `tunnel --no-autoupdate run --token ${authTrimmed}`;
+      argoArgs = `tunnel --no-autoupdate --protocol http2 run --token ${authTrimmed}`;
       console.log('Mode: Permanent Tunnel (Token - base64 credentials)');
     } else {
       // Quick Tunnel 模式
-      argoArgs = `tunnel --no-autoupdate --url http://localhost:${ARGO_PORT}`;
+      argoArgs = `tunnel --no-autoupdate --protocol http2 --url http://localhost:${ARGO_PORT}`;
       console.log('Mode: Quick Tunnel (TryCloudflare)');
     }
     
@@ -440,8 +442,16 @@ app.get("/health", (req, res) => {
 });
 
 // ===== 分享連結產生 =====
+// v3 http2-fix
 function publicDomain() {
-  return (ARGO_DOMAIN || runtimeDomain || '').trim();
+  const d = (ARGO_DOMAIN || runtimeDomain || '').trim();
+  if (d) return d;
+  // 兜底：直接從 cloudflared 日誌裡撈 Quick Tunnel 域名
+  try {
+    const m = fs.readFileSync(logPath, 'utf8').match(/https:\/\/([a-z0-9-]+\.trycloudflare\.com)/i);
+    if (m) { runtimeDomain = m[1]; return runtimeDomain; }
+  } catch (_) {}
+  return '';
 }
 
 function buildVlessLink(domain) {
