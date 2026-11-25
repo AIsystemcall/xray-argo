@@ -124,14 +124,76 @@ function getSystemArchitecture() {
   return (arch === 'arm64' || arch === 'aarch64') ? 'arm64' : 'amd64';
 }
 
-async function downloadFile(fileName, fileUrl) {
-  console.log(`Downloading from ${fileUrl}...`);
-  const res = await axios({ method: 'get', url: fileUrl, responseType: 'stream', timeout: 120000 });
-  res.data.pipe(fs.createWriteStream(fileName));
-  return new Promise((resolve, reject) => {
-    res.data.on('end', resolve);
-    res.data.on('error', reject);
+// v2: Range 分段下載 + 落盤校驗，規避容器出口對單次大響應的截斷
+async function fetchRange(fileUrl, start, end) {
+  return axios({
+    method: 'get',
+    url: fileUrl,
+    responseType: 'arraybuffer',
+    timeout: 180000,
+    maxRedirects: 8,
+    maxContentLength: 200 * 1024 * 1024,
+    maxBodyLength: 200 * 1024 * 1024,
+    headers: {
+      'Accept-Encoding': 'identity',
+      'User-Agent': 'xray-argo/2.0',
+      'Range': `bytes=${start}-${end}`
+    }
   });
+}
+
+async function downloadFile(fileName, fileUrl) {
+  console.log(`[v2 ranged] Downloading from ${fileUrl}...`);
+  const CH = 512 * 1024;
+  const first = await fetchRange(fileUrl, 0, CH - 1);
+  const head = Buffer.from(first.data);
+  let total = 0;
+  const cr = first.headers['content-range'];
+  if (typeof cr === 'string' && cr.indexOf('/') > 0) {
+    total = parseInt(cr.split('/').pop(), 10) || 0;
+  }
+  // 伺服器忽略 Range，直接給全量：落盤即可
+  if (first.status === 200 || !total) {
+    if (head.length < 1000) throw new Error(`download too small: ${head.length} bytes`);
+    fs.writeFileSync(fileName, head);
+    console.log(`[v2 ranged] single shot: ${head.length} bytes -> ${fileName}`);
+    return;
+  }
+  const firstWant = Math.min(CH, total);
+  if (head.length !== firstWant) {
+    throw new Error(`first range short: ${head.length}, expected ${firstWant}`);
+  }
+  const parts = [head];
+  for (let off = CH; off < total; off += CH) {
+    const end = Math.min(off + CH, total) - 1;
+    const want = end - off + 1;
+    let piece = null;
+    for (let k = 1; k <= 5; k++) {
+      try {
+        const r = await fetchRange(fileUrl, off, end);
+        const b = Buffer.from(r.data);
+        if (r.status === 200 || b.length > want) {
+          fs.writeFileSync(fileName, b);
+          console.log(`[v2 ranged] full response at offset ${off}: ${b.length} bytes -> ${fileName}`);
+          return;
+        }
+        if (b.length !== want) throw new Error(`short ${b.length}/${want}`);
+        piece = b;
+        break;
+      } catch (e) {
+        console.error(`[v2 ranged] range ${off}-${end} try ${k}/5: ${e.message}`);
+        if (k === 5) throw new Error(`range download failed at ${off}: ${e.message}`);
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    }
+    parts.push(piece);
+  }
+  const all = Buffer.concat(parts);
+  if (all.length !== total) {
+    throw new Error(`size mismatch: ${all.length}/${total}`);
+  }
+  fs.writeFileSync(fileName, all);
+  console.log(`[v2 ranged] OK: ${all.length} bytes in ${parts.length} parts -> ${fileName}`);
 }
 
 async function downloadAndExtractXray(arch) {
@@ -141,7 +203,14 @@ async function downloadAndExtractXray(arch) {
   const zipPath = path.join(FILE_PATH, `${webName}.zip`);
   
   await downloadFile(zipPath, downloadUrl);
-  
+
+  const zbuf = fs.readFileSync(zipPath);
+  const eocd = zbuf.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  if (zbuf.length < 1000 || eocd < 0 || eocd + 22 > zbuf.length) {
+    throw new Error('xray zip incomplete: size=' + zbuf.length + ', eocd=' + eocd);
+  }
+  console.log('[v2 ranged] zip EOCD ok, size=' + zbuf.length);
+
   // 解壓縮並取出 xray 執行檔
   const zip = new AdmZip(zipPath);
   const zipEntries = zip.getEntries();
@@ -151,7 +220,11 @@ async function downloadAndExtractXray(arch) {
     throw new Error('xray binary not found in zip');
   }
   
-  fs.writeFileSync(webPath, xrayEntry.getData());
+  const xb = xrayEntry.getData();
+  if (xb.length < 1000000 || xb.slice(0, 4).toString('hex') !== '7f454c46') {
+    throw new Error('xray binary invalid: size=' + xb.length);
+  }
+  fs.writeFileSync(webPath, xb);
   fs.chmodSync(webPath, 0o775);
   
   // 清理 zip 檔案
@@ -164,6 +237,11 @@ async function downloadCloudflared(arch) {
   const downloadUrl = `${baseUrl}/${fileName}`;
   
   await downloadFile(botPath, downloadUrl);
+  const bbuf = fs.readFileSync(botPath);
+  if (bbuf.length < 1000000 || bbuf.slice(0, 4).toString('hex') !== '7f454c46') {
+    throw new Error('cloudflared binary invalid: size=' + bbuf.length);
+  }
+  console.log('[v2 ranged] cloudflared ELF ok, size=' + bbuf.length);
   fs.chmodSync(botPath, 0o775);
 }
 
